@@ -42,6 +42,7 @@ logger = logging.getLogger(__name__)
 RECORD_STEP_TIME = envs.SGLANG_RECORD_STEP_TIME.get()
 LOG_FORWARD_ITERS = envs.SGLANG_LOG_FORWARD_ITERS.get()
 ENABLE_METRICS_DEVICE_TIMER = envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.get()
+LOG_EVICTABLE_TOKENS = envs.SGLANG_LOG_EVICTABLE_TOKENS.get()
 
 
 def _decode_total_seq_lens(batch: ScheduleBatch) -> int:
@@ -155,16 +156,20 @@ class SchedulerMetricsReporter:
                 self._mfu_log_write_bytes = 0.0
 
         self.fwd_occupancy = float("nan")
+        self.active_fwd_occupancy = float("nan")
 
         self.forward_pass_device_timer: Optional[DeviceTimer] = None
 
         if ENABLE_METRICS_DEVICE_TIMER:
             self._device_timer_window_batch_count = 0
             self._device_timer_window_gpu_time = 0.0
+            self._device_timer_window_active_gpu_time = 0.0
             self._device_timer_window_start = None
 
             def _wrap_execution_reporter(**kwargs):
                 self._device_timer_window_gpu_time += kwargs["t"]
+                if kwargs.get("category", "") != "idle":
+                    self._device_timer_window_active_gpu_time += kwargs["t"]
                 if self.enable_metrics:
                     self.metrics_collector.increment_forward_execution_seconds(**kwargs)
 
@@ -513,7 +518,10 @@ class SchedulerMetricsReporter:
         )
 
         pool_stats = self.scheduler.pool_stats_observer.get_pool_stats()
-        token_usage_msg = ", ".join(pool_stats.get_prefill_usage_msg_parts()) + ", "
+        usage_parts = pool_stats.get_prefill_usage_msg_parts()
+        if LOG_EVICTABLE_TOKENS:
+            usage_parts += pool_stats.get_evictable_msg_parts()
+        token_usage_msg = ", ".join(usage_parts) + ", "
 
         self.stats.new_token_ratio = prefill_stats.new_token_ratio
         batch_iter = (
@@ -558,7 +566,7 @@ class SchedulerMetricsReporter:
             msg += f", est. prefill TFLOPS/s (per GPU): {tflops_per_s:.2f}"
 
         if ENABLE_METRICS_DEVICE_TIMER:
-            msg += f", fwd occupancy: {self.fwd_occupancy:.2f}%"
+            msg += f", fwd occupancy: {self.fwd_occupancy:.2f}%, active fwd occupancy: {self.active_fwd_occupancy:.2f}%"
 
         if self.is_stats_logging_rank:
             logger.info(msg)
@@ -632,6 +640,7 @@ class SchedulerMetricsReporter:
             # Utilization / LoRA / HiCache
             self._calculate_utilization()
             self.stats.fwd_occupancy = self.fwd_occupancy
+            self.stats.active_fwd_occupancy = self.active_fwd_occupancy
             self._update_lora_metrics()
             self._log_hicache_stats()
             self.metrics_collector.log_stats(self.stats)
@@ -687,7 +696,10 @@ class SchedulerMetricsReporter:
         num_running_reqs = len(batch.reqs)
 
         pool_stats = self.scheduler.pool_stats_observer.get_pool_stats()
-        token_usage_msg = ", ".join(pool_stats.get_decode_usage_msg_parts()) + ", "
+        usage_parts = pool_stats.get_decode_usage_msg_parts()
+        if LOG_EVICTABLE_TOKENS:
+            usage_parts += pool_stats.get_evictable_msg_parts()
+        token_usage_msg = ", ".join(usage_parts) + ", "
 
         if RECORD_STEP_TIME:
             self.step_time_dict[num_running_reqs].append(
@@ -770,7 +782,7 @@ class SchedulerMetricsReporter:
             self._mfu_log_write_bytes = 0.0
 
         if ENABLE_METRICS_DEVICE_TIMER:
-            msg += f", fwd occupancy: {self.fwd_occupancy:.2f}%"
+            msg += f", fwd occupancy: {self.fwd_occupancy:.2f}%, active fwd occupancy: {self.active_fwd_occupancy:.2f}%"
 
         if self.is_stats_logging_rank:
             logger.info(msg)
@@ -846,6 +858,7 @@ class SchedulerMetricsReporter:
             # Utilization / LoRA / HiCache
             self._calculate_utilization()
             self.stats.fwd_occupancy = self.fwd_occupancy
+            self.stats.active_fwd_occupancy = self.active_fwd_occupancy
             self._update_lora_metrics()
             self._log_hicache_stats()
             self.metrics_collector.log_stats(self.stats)
@@ -995,13 +1008,27 @@ class SchedulerMetricsReporter:
             # boundary can phase-lock with the decode-log cadence, turning a
             # one-tick NaN into NaN on every log line. NaN is published only
             # when truly stale (reset_device_timer_window after idle).
+            if self._device_timer_window_active_gpu_time > 0:
+                window_seconds = now - self._device_timer_window_start
+                active_gpu_seconds = self._device_timer_window_active_gpu_time
+                active_gpu_occupancy = active_gpu_seconds / window_seconds * 100
+                logger.debug(f"For the last {self.scheduler.server_args.decode_log_interval} steps, "
+                             f"window_seconds: {window_seconds}, "
+                             f"active_gpu_seconds: {active_gpu_seconds}, "
+                             f"active_gpu_occupancy: {active_gpu_occupancy}")
             self._device_timer_window_start = now
             self._device_timer_window_gpu_time = 0.0
+            self._device_timer_window_active_gpu_time = 0.0
+            self.fwd_occupancy = float("nan")
+            self.active_fwd_occupancy = float("nan")
         else:
             cpu_time = now - self._device_timer_window_start
             if cpu_time > 0:
                 self.fwd_occupancy = min(
                     self._device_timer_window_gpu_time / cpu_time * 100, 100
+                )
+                self.active_fwd_occupancy = min(
+                    self._device_timer_window_active_gpu_time / cpu_time * 100, 100
                 )
         self._device_timer_window_batch_count += 1
         if (
@@ -1011,9 +1038,11 @@ class SchedulerMetricsReporter:
             self._device_timer_window_batch_count = 0
 
     def reset_device_timer_window(self):
-        if ENABLE_METRICS_DEVICE_TIMER:
-            self._device_timer_window_batch_count = 0
-            self.fwd_occupancy = float("nan")
+        # if ENABLE_METRICS_DEVICE_TIMER:
+        #     self._device_timer_window_batch_count = 0
+        #     self.fwd_occupancy = float("nan")
+        #     self.active_fwd_occupancy = float("nan")
+        pass
 
     def _maybe_log_idle_metrics(self):
         """Collect and log metrics every 30 seconds during idle."""

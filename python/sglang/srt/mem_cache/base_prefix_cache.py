@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import logging
 import time
 from abc import ABC, abstractmethod
 from typing import (
@@ -29,6 +30,9 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.unified_cache_components.tree_component import (
         ComponentType,
     )
+
+
+logger = logging.getLogger(__name__)
 
 
 @runtime_checkable
@@ -229,10 +233,17 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         self.metrics_collector = radix_cache_cls(labels=labels)
 
     def update_eviction_metrics(self, num_evicted: int, start_time: float):
-        if self.metrics_collector is not None and num_evicted > 0:
-            self.metrics_collector.observe_eviction_duration(
-                time.perf_counter() - start_time
-            )
+        if num_evicted <= 0:
+            return
+        duration = time.perf_counter() - start_time
+        logger.debug(
+            "[%s] cache eviction: evicted %d tokens in %.3f ms",
+            self.__class__.__name__,
+            num_evicted,
+            duration * 1000,
+        )
+        if self.metrics_collector is not None:
+            self.metrics_collector.observe_eviction_duration(duration)
             self.metrics_collector.increment_eviction_num_tokens(num_evicted)
 
     @abstractmethod

@@ -5,8 +5,8 @@ use super::{
     model_card::ModelCard,
     model_type::ModelType,
     worker::{
-        parse_bootstrap_host_from_url, BasicWorker, ConnectionMode, DPAwareWorker, HealthConfig,
-        RuntimeType, WorkerMetadata, WorkerRoutingKeyLoad, WorkerType,
+        BasicWorker, ConnectionMode, DPAwareWorker, HealthConfig, RuntimeType, WorkerMetadata,
+        WorkerRoutingKeyLoad, WorkerType,
     },
 };
 use crate::{observability::metrics::Metrics, routers::grpc::client::GrpcClient};
@@ -23,6 +23,8 @@ pub struct BasicWorkerBuilder {
     health_config: HealthConfig,
     circuit_breaker_config: CircuitBreakerConfig,
     grpc_client: Option<GrpcClient>,
+    bootstrap_host_override: Option<String>,
+    bootstrap_port_override: Option<Option<u16>>,
 }
 
 impl BasicWorkerBuilder {
@@ -39,6 +41,8 @@ impl BasicWorkerBuilder {
             health_config: HealthConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
             grpc_client: None,
+            bootstrap_host_override: None,
+            bootstrap_port_override: None,
         }
     }
 
@@ -55,6 +59,8 @@ impl BasicWorkerBuilder {
             health_config: HealthConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
             grpc_client: None,
+            bootstrap_host_override: None,
+            bootstrap_port_override: None,
         }
     }
 
@@ -124,6 +130,18 @@ impl BasicWorkerBuilder {
         self
     }
 
+    /// Override the bootstrap host (used by DPAwareWorkerBuilder to avoid URL parsing issues)
+    pub fn bootstrap_host_override(mut self, host: String) -> Self {
+        self.bootstrap_host_override = Some(host);
+        self
+    }
+
+    /// Override the bootstrap port (used by DPAwareWorkerBuilder)
+    pub fn bootstrap_port_override(mut self, port: Option<u16>) -> Self {
+        self.bootstrap_port_override = Some(port);
+        self
+    }
+
     /// Build the BasicWorker instance
     pub fn build(self) -> BasicWorker {
         use std::sync::{
@@ -133,11 +151,40 @@ impl BasicWorkerBuilder {
 
         use tokio::sync::OnceCell;
 
-        let bootstrap_host = parse_bootstrap_host_from_url(&self.url);
+        let bootstrap_host = if let Some(host) = self.bootstrap_host_override {
+            host
+        } else {
+            match url::Url::parse(&self.url) {
+                Ok(parsed) => parsed.host_str().unwrap_or("localhost").to_string(),
+                Err(_) if !self.url.contains("://") => {
+                    match url::Url::parse(&format!("http://{}", self.url)) {
+                        Ok(parsed) => parsed.host_str().unwrap_or("localhost").to_string(),
+                        Err(_) => {
+                            tracing::warn!(
+                                "Failed to parse URL '{}', defaulting to localhost",
+                                self.url
+                            );
+                            "localhost".to_string()
+                        }
+                    }
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "Failed to parse URL '{}', defaulting to localhost",
+                        self.url
+                    );
+                    "localhost".to_string()
+                }
+            }
+        };
 
-        let bootstrap_port = match self.worker_type {
-            WorkerType::Prefill { bootstrap_port } => bootstrap_port,
-            _ => None,
+        let bootstrap_port = if let Some(port) = self.bootstrap_port_override {
+            port
+        } else {
+            match self.worker_type {
+                WorkerType::Prefill { bootstrap_port } => bootstrap_port,
+                _ => None,
+            }
         };
 
         let metadata = WorkerMetadata {
@@ -314,6 +361,17 @@ impl DPAwareWorkerBuilder {
     /// Build the DPAwareWorker instance
     pub fn build(self) -> DPAwareWorker {
         let worker_url = format!("{}@{}", self.base_url, self.dp_rank);
+        // Parse bootstrap_host from base_url (without @dp_rank suffix) to avoid
+        // the URL parser treating "http://host:port@rank" as userinfo@host.
+        let bootstrap_host = match url::Url::parse(&self.base_url) {
+            Ok(parsed) => parsed.host_str().unwrap_or("localhost").to_string(),
+            Err(_) => "localhost".to_string(),
+        };
+        let bootstrap_port = match &self.worker_type {
+            WorkerType::Prefill { bootstrap_port } => *bootstrap_port,
+            _ => None,
+        };
+
         let mut builder = BasicWorkerBuilder::new(worker_url)
             .models(self.models)
             .worker_type(self.worker_type)
@@ -321,7 +379,9 @@ impl DPAwareWorkerBuilder {
             .runtime_type(self.runtime_type)
             .labels(self.labels)
             .health_config(self.health_config)
-            .circuit_breaker_config(self.circuit_breaker_config);
+            .circuit_breaker_config(self.circuit_breaker_config)
+            .bootstrap_host_override(bootstrap_host)
+            .bootstrap_port_override(bootstrap_port);
 
         if let Some(client) = self.grpc_client {
             builder = builder.grpc_client(client);

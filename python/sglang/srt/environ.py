@@ -216,6 +216,8 @@ class Envs:
     SGLANG_LOG_REQUEST_HEADERS = EnvTuple(tuple())
     SGLANG_LOG_SCHEDULER_STATUS_TARGET = EnvStr("")
     SGLANG_LOG_SCHEDULER_STATUS_INTERVAL = EnvFloat(60.0)
+    SGLANG_LOG_EVICTABLE_TOKENS = EnvBool(False)
+    SGLANG_LOG_DETAILED_REQ_TIME = EnvBool(False)
 
     # SGLang CI
     SGLANG_IS_IN_CI = EnvBool(False)

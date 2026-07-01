@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 from typing_extensions import Self
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.metrics_collector import (
     SchedulerMetricsCollector,
@@ -1034,7 +1035,33 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                     queue_duration >= 0 and forward_duration >= 0
                 ), f"queue_duration={queue_duration} < 0 or forward_duration={forward_duration} < 0"
 
-            return f"queue_duration={self.format_duration(queue_duration)}, forward_duration={self.format_duration(forward_duration)}, entry_time={self.format_wallclock(self.wait_queue_entry_time)}"
+            if envs.SGLANG_LOG_DETAILED_REQ_TIME.get():
+                pre_process_duration = self.duration_between(
+                    self.scheduler_recv_time, self.wait_queue_entry_time
+                )
+                prefill_forward_duration = self.duration_between(
+                    self.forward_entry_time, self.prefill_finished_time
+                )
+                decode_duration = self.duration_between(
+                    self.prefill_finished_time, self.completion_time
+                )
+                total_duration = self.duration_between(
+                    self.scheduler_recv_time, self.completion_time
+                )
+                return (
+                    f"pre_process_duration={self.format_duration(pre_process_duration)}, "
+                    f"queue_duration={self.format_duration(queue_duration)}, "
+                    f"prefill_forward_duration={self.format_duration(prefill_forward_duration)}, "
+                    f"decode_duration={self.format_duration(decode_duration)}, "
+                    f"total_duration={self.format_duration(total_duration)}, "
+                    f"entry_time={self.format_wallclock(self.scheduler_recv_time)}"
+                )
+            else:
+                return (
+                    f"queue_duration={self.format_duration(queue_duration)}, "
+                    f"forward_duration={self.format_duration(forward_duration)}, "
+                    f"entry_time={self.format_wallclock(self.wait_queue_entry_time)}"
+                )
         elif self.disagg_mode == DisaggregationMode.PREFILL:
             bootstrap_queue_duration = self.duration_between(
                 self.prefill_bootstrap_queue_entry_time, self.wait_queue_entry_time
@@ -1073,15 +1100,55 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             else:
                 bootstrap_fields = f"bootstrap_queue_duration={self.format_duration(bootstrap_queue_duration)}, "
 
-            return (
-                f"{bootstrap_fields}"
-                f"queue_duration={self.format_duration(queue_duration)}, "
-                f"forward_duration={self.format_duration(forward_duration)}, "
-                f"entry_time={self.format_wallclock(self.prefill_bootstrap_queue_entry_time)}, "
-                f"transfer_speed={self.transfer_speed_gb_s:.2f} GB/s, "
-                f"transfer_total={self.transfer_total_mb:.2f} MB, "
-                f"#retries={self.prefill_retry_count}"
-            )
+            if envs.SGLANG_LOG_DETAILED_REQ_TIME.get():
+                pre_process_duration = self.duration_between(
+                    self.scheduler_recv_time, self.prefill_bootstrap_queue_entry_time
+                )
+                enter_wait_queue_duration = self.duration_between(
+                    self.bootstrap_done_time, self.wait_queue_entry_time
+                )
+                prefill_forward_duration = self.duration_between(
+                    self.forward_entry_time, self.prefill_finished_time
+                )
+                enter_transfer_queue_duration = self.duration_between(
+                    self.prefill_finished_time, self.prefill_transfer_queue_entry_time
+                )
+                kv_transfer_duration = self.duration_between(
+                    self.prefill_transfer_queue_entry_time,
+                    self.prefill_kv_transfer_finish_time,
+                )
+                total_duration = self.duration_between(
+                    self.scheduler_recv_time, self.completion_time
+                )
+                return (
+                    f"pre_process_duration={self.format_duration(pre_process_duration)}, "
+                    f"{bootstrap_fields}"
+                    f"enter_wait_queue_duration={self.format_duration(enter_wait_queue_duration)}, "
+                    f"queue_duration={self.format_duration(queue_duration)}, "
+                    f"prefill_forward_duration={self.format_duration(prefill_forward_duration)}, "
+                    f"enter_transfer_queue_duration={self.format_duration(enter_transfer_queue_duration)}, "
+                    f"kv_transfer_duration={self.format_duration(kv_transfer_duration)}, "
+                    f"forward_duration={self.format_duration(forward_duration)}, "
+                    f"total_duration={self.format_duration(total_duration)}, "
+                    f"entry_time={self.format_wallclock(self.prefill_bootstrap_queue_entry_time)}, "
+                    f"transfer_speed={self.transfer_speed_gb_s:.2f} GB/s, "
+                    f"transfer_total={self.transfer_total_mb:.2f} MB, "
+                    f"#retries={self.prefill_retry_count}"
+                )
+            else:
+                prefill_forward_duration = self.duration_between(
+                    self.forward_entry_time, self.prefill_finished_time
+                )
+                return (
+                    f"{bootstrap_fields}"
+                    f"queue_duration={self.format_duration(queue_duration)}, "
+                    f"prefill_forward_duration={self.format_duration(prefill_forward_duration)}, "
+                    f"forward_duration={self.format_duration(forward_duration)}, "
+                    f"entry_time={self.format_wallclock(self.prefill_bootstrap_queue_entry_time)}, "
+                    f"transfer_speed={self.transfer_speed_gb_s:.2f} GB/s, "
+                    f"transfer_total={self.transfer_total_mb:.2f} MB, "
+                    f"#retries={self.prefill_retry_count}"
+                )
         elif self.disagg_mode == DisaggregationMode.DECODE:
             prealloc_duration = self.duration_between(
                 self.decode_prealloc_queue_entry_time,
@@ -1099,6 +1166,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                 self.forward_entry_time,
                 self.completion_time,
             )
+            total_duration = self.duration_between(self.scheduler_recv_time, self.completion_time)
 
             if SGLANG_TEST_REQUEST_TIME_STATS:
                 if self.wait_queue_entry_time > 0:
@@ -1133,6 +1201,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                 f"transfer_duration={self.format_duration(transfer_duration)}, "
                 f"queue_duration={self.format_duration(queue_duration)}, "
                 f"forward_duration={self.format_duration(forward_duration)}, "
+                f"total_duration={self.format_duration(total_duration)}, "
                 f"entry_time={self.format_wallclock(self.decode_prealloc_queue_entry_time)}"
             )
         else:

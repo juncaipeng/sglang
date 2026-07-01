@@ -93,6 +93,7 @@ async def async_request_openai_chat_completions(
     payload,
     url,
     pbar=None,
+    headers=None,
 ):
     """Send a streaming request to an OpenAI-compatible /v1/chat/completions endpoint.
 
@@ -108,7 +109,8 @@ async def async_request_openai_chat_completions(
         output = RequestFuncOutput()
 
         try:
-            async with session.post(url=url, json=payload) as response:
+            # async with session.post(url=url, json=payload) as response:
+            async with session.post(url=url, json=payload, headers=headers or {}) as response:
                 if response.status == 200:
                     prompt_tokens = 0
                     cached_tokens = 0
@@ -175,8 +177,8 @@ async def async_request_openai_chat_completions(
     return output
 
 
-def gen_payload_openai(messages, output_len, model):
-    return {
+def gen_payload_openai(messages, output_len, model, min_output_len=0):
+    payload = {
         "model": model,
         "messages": messages,
         "max_tokens": output_len,
@@ -184,16 +186,22 @@ def gen_payload_openai(messages, output_len, model):
         "stream": True,
         "stream_options": {"include_usage": True},
     }
+    if min_output_len > 0:
+        payload["min_tokens"] = min_output_len
+    return payload
 
 
-def gen_payload(input_ids, output_len, lora_path=""):
+def gen_payload(input_ids, output_len, lora_path="", min_output_len=0):
+    params = {
+        "temperature": 0.0,
+        "max_new_tokens": output_len,
+        "ignore_eos": True,
+    }
+    if min_output_len > 0:
+        params["min_new_tokens"] = min_output_len
     return {
         "input_ids": input_ids,
-        "sampling_params": {
-            "temperature": 0.0,
-            "max_new_tokens": output_len,
-            "ignore_eos": True,
-        },
+        "sampling_params": params,
         "stream": True,
         "stream_options": {"include_usage": True},
         "lora_path": lora_path,
