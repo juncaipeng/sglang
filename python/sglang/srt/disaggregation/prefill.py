@@ -461,6 +461,7 @@ class SchedulerDisaggregationPrefillMixin:
     def event_loop_overlap_disagg_prefill(self: Scheduler) -> None:
         self.result_queue = deque()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+        self.idle_step = 0
 
         while True:
             # Receive requests
@@ -482,6 +483,9 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Launch the current batch
             if batch:
+                logger.debug(f"prefill run batch, self.idle_step: {self.idle_step}")
+                self.idle_step = 0
+
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
                 batch_result = self.run_batch(batch)
@@ -494,6 +498,7 @@ class SchedulerDisaggregationPrefillMixin:
                 tmp_batch, tmp_result = self.result_queue.popleft()
                 self.process_batch_result(tmp_batch, tmp_result)
             elif batch is None:
+                self.idle_step += 1
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
 

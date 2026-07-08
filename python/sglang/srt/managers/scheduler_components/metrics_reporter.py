@@ -1008,7 +1008,7 @@ class SchedulerMetricsReporter:
             # boundary can phase-lock with the decode-log cadence, turning a
             # one-tick NaN into NaN on every log line. NaN is published only
             # when truly stale (reset_device_timer_window after idle).
-            if self._device_timer_window_active_gpu_time > 0:
+            if self._device_timer_window_active_gpu_time > 0 and self._device_timer_window_start is not None:
                 window_seconds = now - self._device_timer_window_start
                 active_gpu_seconds = self._device_timer_window_active_gpu_time
                 active_gpu_occupancy = active_gpu_seconds / window_seconds * 100

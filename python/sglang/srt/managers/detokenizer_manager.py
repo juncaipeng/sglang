@@ -161,8 +161,12 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         while True:
             with self.soft_watchdog.disable():
                 recv_obj = self.recv_from_scheduler.recv_pyobj()
+            if hasattr(recv_obj, "rids"):
+                logger.info(f"[TIMING] detok_recv rids={recv_obj.rids}")
             output = self._request_dispatcher(recv_obj)
             if output is not None:
+                if hasattr(output, "rids"):
+                    logger.info(f"[TIMING] detok_send rids={output.rids}")
                 self.send_to_tokenizer.send_pyobj(output)
             self.soft_watchdog.feed()
 

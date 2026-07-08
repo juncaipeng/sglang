@@ -1424,6 +1424,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 await asyncio.wait_for(
                     state.event.wait(), timeout=_REQUEST_STATE_WAIT_TIMEOUT
                 )
+                logger.info(f"[TIMING] tokenizer event_wakeup rid={obj.rid}")
             except asyncio.TimeoutError:
                 if (
                     request is not None
@@ -1814,6 +1815,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         while True:
             with self.soft_watchdog.disable():
                 recv_obj = await self.recv_from_detokenizer.recv_pyobj()
+            if hasattr(recv_obj, "rids"):
+                logger.info(f"[TIMING] tokenizer_recv rids={recv_obj.rids}")
             if isinstance(
                 recv_obj,
                 (BatchStrOutput, BatchEmbeddingOutput, BatchTokenIDOutput),

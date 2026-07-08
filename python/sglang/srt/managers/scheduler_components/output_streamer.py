@@ -165,6 +165,8 @@ class SchedulerOutputStreamer:
             has_reqs=bool(reqs),
         )
         if payload is not None:
+            if hasattr(payload, "rids"):
+                logger.info(f"[TIMING] send_to_detokenizer rids={payload.rids}")
             self.send_to_detokenizer.send_output(payload)
 
     def _maybe_log_time_stats(self, *, req: Req) -> None:

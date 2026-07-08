@@ -1966,6 +1966,7 @@ class Scheduler(
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None
         )
+        logger.debug(f"scheduler received request, rid: {recv_req.rid}")
 
         if session_id is None:
             # Normal non-session request

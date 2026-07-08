@@ -50,8 +50,13 @@ def _create_logger_with_handler(name: str, handler: logging.Handler) -> logging.
     logger.setLevel(logging.INFO)
     logger.propagate = False
     if not logger.handlers:
+        import os
+
+        _ms_fmt = ".%(msecs)03d" if os.environ.get("SGLANG_LOG_MS") else ""
         handler.setFormatter(
-            logging.Formatter("[%(asctime)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+            logging.Formatter(
+                f"[%(asctime)s{_ms_fmt}] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+            )
         )
         logger.addHandler(handler)
     return logger
