@@ -2048,6 +2048,7 @@ class Scheduler(
             recv_req.session_id is not None
             and self.server_args.enable_session_radix_cache
         )
+        logger.debug(f"scheduler received request, rid: {recv_req.rid}")
 
         if session_id is None or radix_native_session:
             # Normal non-session request, or a radix-native session request

@@ -1457,6 +1457,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 await asyncio.wait_for(
                     state.event.wait(), timeout=_REQUEST_STATE_WAIT_TIMEOUT
                 )
+                logger.info(f"[TIMING] tokenizer event_wakeup rid={obj.rid}")
             except asyncio.TimeoutError:
                 if (
                     request is not None

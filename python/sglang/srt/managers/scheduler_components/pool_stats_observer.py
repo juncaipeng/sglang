@@ -117,6 +117,21 @@ class PoolStats:
             )
         return parts
 
+    def get_evictable_msg_parts(self) -> List[str]:
+        parts = []
+        if self.is_hybrid_swa:
+            parts += [
+                f"#full evictable token: {self.full_evictable_size}",
+                f"#swa evictable token: {self.swa_evictable_size}",
+            ]
+        if self.is_hybrid_ssm:
+            if not self.is_hybrid_swa:
+                parts.append(f"#full evictable token: {self.full_evictable_size}")
+            parts.append(f"#mamba evictable: {self.mamba_evictable_size}")
+        if not parts:
+            parts.append(f"#evictable token: {self.full_evictable_size}")
+        return parts
+
     def update_scheduler_stats(self, stats: SchedulerStats) -> None:
         """Update pool-related fields on SchedulerStats."""
         num_used, _ = self.get_kv_token_stats()

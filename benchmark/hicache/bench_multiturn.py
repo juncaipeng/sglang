@@ -1,15 +1,16 @@
 import argparse
 import asyncio
 import json
+import logging
 import queue
 import random
 import threading
 import time
+import uuid
 from datetime import datetime
 
 import numpy as np
 import requests
-from tqdm.asyncio import tqdm
 
 from sglang.bench_serving import RequestFuncOutput
 from sglang.benchmark.datasets.random import sample_random_requests
@@ -20,6 +21,8 @@ from sglang.test.kits.cache_hit_kit import (
     gen_payload,
     gen_payload_openai,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def parse_args():
@@ -51,6 +54,12 @@ def parse_args():
         help="Length of each output",
     )
     parser.add_argument(
+        "--min-output-length",
+        type=int,
+        default=0,
+        help="Minimum output tokens per request (0 = no minimum)",
+    )
+    parser.add_argument(
         "--num-rounds",
         type=int,
         default=5,
@@ -67,7 +76,7 @@ def parse_args():
         "--request-rate",
         type=float,
         default=1.0,
-        help="Average number of requests per second",
+        help="Average number of requests per second (0 = no rate limit)",
     )
     parser.add_argument(
         "--host",
@@ -177,7 +186,7 @@ def log_to_jsonl_file(data, file_path="performance_metrics.jsonl", tag=""):
                 json.dumps(timestamped_data) + "\n"
             )  # Write as a single line in JSONL format
     except IOError as e:
-        print(f"Error writing to JSONL file: {e}")
+        logger.error(f"Error writing to JSONL file: {e}")
 
 
 class ReadyQueue:
@@ -230,6 +239,8 @@ class WorkloadGenerator:
 
         self.sent_requests = 0
         self.completed_requests = 0
+        self.completed_clients = 0
+        self.success_clients = 0
 
         # Resolve per-client round counts
         min_rounds = args.min_rounds
@@ -265,10 +276,10 @@ class WorkloadGenerator:
             sum(1 for t in self.client_total_rounds if t > r) for r in range(max_rounds)
         ]
         self.total_requests = sum(self.client_total_rounds)
-
         range_ratio = args.range_ratio
 
         # Use return_text=False to get token ids instead of text
+        logger.info("sample random requests...")
         first_round_samples = sample_random_requests(
             input_len=args.request_length,
             output_len=args.output_length,
@@ -291,6 +302,7 @@ class WorkloadGenerator:
 
         num_sub_questions = sum(max(t - 1, 0) for t in self.client_total_rounds)
 
+        logger.info("sample sub question inputs...")
         self.sub_question_inputs = sample_random_requests(
             input_len=sub_question_input_length,
             output_len=args.output_length,
@@ -320,6 +332,7 @@ class WorkloadGenerator:
                         initial_messages[i],
                         first_round_output_lens[i],
                         self.model_path,
+                        args.min_output_length,
                     ),
                 )
                 for i in range(args.num_clients)
@@ -329,6 +342,7 @@ class WorkloadGenerator:
                     "round": 0,
                     "history": initial_messages[i],
                     "total_rounds": self.client_total_rounds[i],
+                    "session_id": str(uuid.uuid4()),
                 }
                 for i in range(args.num_clients)
             }
@@ -341,6 +355,7 @@ class WorkloadGenerator:
                         self.candidate_inputs[i],
                         first_round_output_lens[i],
                         args.lora_path,
+                        args.min_output_length,
                     ),
                 )
                 for i in range(args.num_clients)
@@ -350,6 +365,7 @@ class WorkloadGenerator:
                     "round": 0,
                     "history": list(self.candidate_inputs[i]),
                     "total_rounds": self.client_total_rounds[i],
+                    "session_id": str(uuid.uuid4()),
                 }
                 for i in range(args.num_clients)
             }
@@ -359,7 +375,6 @@ class WorkloadGenerator:
         self.candidate_inputs = self.candidate_inputs[args.num_clients :]
 
         self.response_queue = queue.Queue()
-        self.pbar = tqdm(total=self.total_requests)
         self.performance_metrics = {
             "ttft": [],
             "itl": [],
@@ -384,47 +399,76 @@ class WorkloadGenerator:
         self.num_rounds = self.max_rounds
         self.max_parallel = args.max_parallel
         self.output_length = args.output_length
+        self.min_output_length = args.min_output_length
+        logger.info("finish initialization")
 
     async def handle_request(self, item):
         client_id, payload = item
+        round_num = self.client_records[client_id]["round"]
+        session_id = self.client_records[client_id]["session_id"]
+        rid = f"{session_id}-round-{round_num}"
+        headers = {"X-SMG-Routing-Key": session_id, "X-Request-Id": rid}
+        logger.info(f"Send request {rid}")
+
         try:
-            response = await self.request_func(payload, self.url, self.pbar)
-            if self.pbar.n == self.pbar.total:
-                self.finished_time = time.perf_counter()
-            self.response_queue.put((client_id, response))
+            response = await self.request_func(payload, self.url, None, headers=headers)
+            self.finished_time = time.perf_counter()
+
+            logger.info(f"Receive response {rid}")
+            self.response_queue.put((client_id, rid, response))
         except Exception as e:
-            print(f"Request failed for client {client_id}: {e}")
+            logger.error(f"Request failed for client {client_id}: {e}")
             failed_response = RequestFuncOutput()
             failed_response.success = False
             failed_response.error = str(e)
-            self.response_queue.put((client_id, failed_response))
+            self.response_queue.put((client_id, rid, failed_response))
 
     def request_sender(self):
         async def request_loop():
+            idle_loop_idx = 0
             while True:
-                if self.sent_requests - self.completed_requests < self.max_parallel:
+                if self.sent_requests - self.completed_requests < self.max_parallel \
+                    and self.completed_clients < self.num_clients:
                     new_request = self.ready_queue.pop()
                     if new_request:
+                        client_id, _ = new_request
+                        round_num = self.client_records[client_id]["round"]
                         asyncio.create_task(self.handle_request(new_request))
                         self.sent_requests += 1
+
+                        if self.request_rate <= 0 and round_num == 0:
+                            # Sleep to avoid busy-waiting
+                            await asyncio.sleep(0.1)
+                        idle_loop_idx = 0
+                    else:
+                        await asyncio.sleep(0.05)
+                        # idle_loop_idx += 1
+                        # if idle_loop_idx % 100 == 0:
+                        #     logger.info(f"idle loop idx: {idle_loop_idx}, idle for {idle_loop_idx * 0.05} seconds")
+                        #     logger.info(self._progress_info())
                 else:
+                    # idle_loop_idx += 1
+                    # if idle_loop_idx % 100 == 0:
+                    #     logger.info(f"idle loop idx: {idle_loop_idx}, idle for {idle_loop_idx * 0.05} seconds")
+                    #     logger.info(self._progress_info())
+
                     await asyncio.sleep(0.05)
                     continue
 
-                if self.pbar.n == self.pbar.total:
+                if self.completed_clients == self.num_clients:
+                    logger.info("All clients are finished, break the sender loop")
                     break
 
-                # Calculate Poisson-distributed wait time
-                if self.distribution == "poisson":
-                    sleep_time = random.expovariate(self.request_rate)
-                elif self.distribution == "uniform":
-                    avg_interval = (
-                        1.0 / self.request_rate if self.request_rate > 0 else 1.0
-                    )
-                    sleep_time = random.uniform(0, 2 * avg_interval)
-                else:
-                    raise ValueError("Invalid distribution type")
-                await asyncio.sleep(sleep_time)  # Wait before sending the next request
+                # Calculate Poisson-distributed wait time (0 = no rate limit)
+                if self.request_rate > 0:
+                    if self.distribution == "poisson":
+                        sleep_time = random.expovariate(self.request_rate)
+                    elif self.distribution == "uniform":
+                        avg_interval = 1.0 / self.request_rate
+                        sleep_time = random.uniform(0, 2 * avg_interval)
+                    else:
+                        raise ValueError("Invalid distribution type")
+                    await asyncio.sleep(sleep_time)
 
         # Create and run the event loop for asynchronous requests
         loop = asyncio.new_event_loop()
@@ -438,13 +482,16 @@ class WorkloadGenerator:
         barrier_round_completed = 0
         while True:
             try:
-                client_id, response = self.response_queue.get(
+                client_id, rid, response = self.response_queue.get(
                     timeout=10
                 )  # Block until response is available
+
                 if not response.success:
-                    print(f"Request failed for client {client_id}: {response.error}")
-                    self.completed_requests += 1
+                    logger.error(f"Request failed for client: {client_id}, rid: {rid}, error: {response.error}")
+                    self.completed_clients += 1
+                    self.client_records[client_id]["round"] = self.client_records[client_id]["total_rounds"]  # Prevent further processing
                     continue
+
                 # Extend history with response
                 if self.api_format == "openai":
                     if response.generated_text:
@@ -480,6 +527,12 @@ class WorkloadGenerator:
                         "generated_len"
                     ].append(response.generated_len)
                 self.completed_requests += 1
+                if self.client_records[client_id]["round"] == self.client_records[client_id]["total_rounds"]:
+                    self.completed_clients += 1
+                    self.success_clients += 1
+                    logger.info(f"Client {client_id} completed all rounds")
+
+                logger.info(self._progress_info())
 
                 client_total = self.client_records[client_id]["total_rounds"]
                 if self.client_records[client_id]["round"] < client_total:
@@ -496,6 +549,7 @@ class WorkloadGenerator:
                                 self.client_records[client_id]["history"],
                                 sub_q.output_len,
                                 self.model_path,
+                                self.min_output_length,
                             ),
                         )
                     else:
@@ -508,6 +562,7 @@ class WorkloadGenerator:
                                 self.client_records[client_id]["history"],
                                 sub_q.output_len,
                                 self.lora_path,
+                                self.min_output_length,
                             ),
                         )
                     if self.enable_round_barrier:
@@ -524,8 +579,8 @@ class WorkloadGenerator:
                     barrier_round_completed += 1
                     expected = self.clients_per_round[current_barrier_round]
                     if barrier_round_completed == expected:
-                        print(
-                            f"\n  Barrier: round {current_barrier_round} complete "
+                        logger.info(
+                            f"Barrier: round {current_barrier_round} complete "
                             f"({expected} clients), releasing {len(next_round_reqs)} "
                             f"requests for round {current_barrier_round + 1}"
                         )
@@ -537,11 +592,19 @@ class WorkloadGenerator:
                         current_barrier_round += 1
                         barrier_round_completed = 0
             except queue.Empty:
-                if self.pbar.n == self.pbar.total:
+                if self.completed_clients == self.num_clients:
                     break
+                else:
+                    logger.warning("ready_queue is empty, wait for response")
+                    logger.info(self._progress_info())
             except ValueError as e:
-                print(f"Error processing response for client {client_id}: {e}")
+                logger.error(f"Error processing response for client {client_id}: {e}")
                 continue
+    
+    def _progress_info(self):
+        return f"Overall progress: sent requests num {self.sent_requests}, " \
+               f"completed requests num {self.completed_requests}, " \
+               f"completed clients {self.completed_clients}/{self.num_clients}"
 
     def _send_heartbeat(self, input_len=100, output_len=20):
         """Send a small heartbeat request to the server."""
@@ -550,19 +613,19 @@ class WorkloadGenerator:
         try:
             requests.post(self.url, json=payload, timeout=30)
         except Exception as e:
-            print(f"Heartbeat request failed: {e}")
+            logger.warning(f"Heartbeat request failed: {e}")
 
     def run(self):
         request_thread = threading.Thread(target=self.request_sender, daemon=True)
         response_thread = threading.Thread(target=self.response_handler, daemon=True)
 
         self.start_time = time.perf_counter()
+        logger.info("start request_sender and response_handler")
         request_thread.start()
         response_thread.start()
 
         request_thread.join()
         response_thread.join()
-        self.pbar.close()
 
         duration = self.finished_time - self.start_time
         sorted_ttft = sorted(self.performance_metrics["ttft"])
@@ -630,7 +693,7 @@ class WorkloadGenerator:
                     self.performance_metrics["generated_len"]
                 )
                 / duration,
-                "throughput": self.pbar.total / duration,
+                "throughput": self.completed_requests / duration,
                 "cache_hit_rate": (
                     0
                     if sum(self.performance_metrics["prompt_len"]) == 0
@@ -658,56 +721,16 @@ class WorkloadGenerator:
                     ),
                     "request_count": len(round_metrics["ttft"]),
                 }
-        print("All requests completed")
-        print("Performance metrics summary:")
-        print(
-            f"  Total requests: {performance_data['summary']['total_requests']} at {performance_data['summary']['request_rate']} requests per second"
-        )
-        print(
-            f"  Average Prompt Length: {performance_data['summary']['average_prompt_len']:.2f} tokens"
-        )
-        print(
-            f"  Average Output Length: {performance_data['summary']['average_output_len']:.2f} tokens"
-        )
-        print(
-            f"  P90 Prompt Length: {performance_data['summary']['p90_prompt_len']:.0f} tokens"
-        )
-        print(
-            f"  P99 Prompt Length: {performance_data['summary']['p99_prompt_len']:.0f} tokens"
-        )
-        print(
-            f"  P90 Output Length: {performance_data['summary']['p90_output_len']:.0f} tokens"
-        )
-        print(
-            f"  P99 Output Length: {performance_data['summary']['p99_output_len']:.0f} tokens"
-        )
-        print(f"  Average TTFT: {performance_data['summary']['average_ttft']:.2f}")
-        print(f"  P90 TTFT: {performance_data['summary']['p90_ttft']:.2f}")
-        print(f"  P99 TTFT: {performance_data['summary']['p99_ttft']:.2f}")
-        print(f"  Median TTFT: {performance_data['summary']['median_ttft']:.2f}")
-        print(f"  Max TTFT: {performance_data['summary']['max_ttft']:.2f}")
-        print(f"  Average ITL: {performance_data['summary']['average_itl']:.4f}")
-        print(f"  P90 ITL: {performance_data['summary']['p90_itl']:.4f}")
-        print(f"  P99 ITL: {performance_data['summary']['p99_itl']:.4f}")
-        print(f"  Median ITL: {performance_data['summary']['median_itl']:.4f}")
-        print(f"  Max ITL: {performance_data['summary']['max_itl']:.4f}")
-        print(
-            f"  Average latency: {performance_data['summary']['average_latency']:.2f}"
-        )
-        print(f"  P90 latency: {performance_data['summary']['p90_latency']:.2f}")
-        print(f"  P99 latency: {performance_data['summary']['p99_latency']:.2f}")
-        print(f"  Median latency: {performance_data['summary']['median_latency']:.2f}")
-        print(f"  Max latency: {performance_data['summary']['max_latency']:.2f}")
-        print(
-            f"  Input token throughput: {performance_data['summary']['input_token_throughput']:.2f} tokens per second"
-        )
-        print(
-            f"  Output token throughput: {performance_data['summary']['output_token_throughput']:.2f} tokens per second"
-        )
-        print(
-            f"  Request Throughput: {performance_data['summary']['throughput']:.2f} requests per second"
-        )
-        print(f"  Cache Hit Rate: {performance_data['summary']['cache_hit_rate']:.6f}")
+        s = performance_data['summary']
+        print("All requests completed — Performance metrics summary:")
+        print(f"  Total requests: {self.total_requests}, finish requests: {s['total_requests']}, total clients: {self.num_clients}, finish clients: {self.success_clients}, {s['request_rate']} req/s")
+        print(f"  Prompt Length (tokens):  avg={s['average_prompt_len']:.2f}  P90={s['p90_prompt_len']:.0f}  P99={s['p99_prompt_len']:.0f}")
+        print(f"  Output Length (tokens):  avg={s['average_output_len']:.2f}  P90={s['p90_output_len']:.0f}  P99={s['p99_output_len']:.0f}")
+        print(f"  TTFT (s):    avg={s['average_ttft']:.2f}  P90={s['p90_ttft']:.2f}  P99={s['p99_ttft']:.2f}  median={s['median_ttft']:.2f}  max={s['max_ttft']:.2f}")
+        print(f"  ITL (s):     avg={s['average_itl']:.4f}  P90={s['p90_itl']:.4f}  P99={s['p99_itl']:.4f}  median={s['median_itl']:.4f}  max={s['max_itl']:.4f}")
+        print(f"  Latency (s): avg={s['average_latency']:.2f}  P90={s['p90_latency']:.2f}  P99={s['p99_latency']:.2f}  median={s['median_latency']:.2f}  max={s['max_latency']:.2f}")
+        print(f"  Throughput:  input={s['input_token_throughput']:.2f} tok/s  output={s['output_token_throughput']:.2f} tok/s  req={s['throughput']:.2f} req/s")
+        print(f"  Cache Hit Rate: {s['cache_hit_rate']:.6f}")
 
         if self.enable_round_barrier:
             # Print round-basedsummary
@@ -735,21 +758,25 @@ class WorkloadGenerator:
 
 if __name__ == "__main__":
     args = parse_args()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
     flush_cache_url = f"http://{args.host}:{args.port}/flush_cache"
 
     random.seed(args.seed)
     np.random.seed(args.seed)
 
     if args.disable_auto_run:
-        print("Running with specified request rate...")
+        logger.info("Running with specified request rate...")
         request_rates = [args.request_rate]
     else:
-        print("Auto-running with different request rates...")
+        logger.info("Auto-running with different request rates...")
         request_rates = [16, 14, 12, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1]
 
     for rate in request_rates:
         args.request_rate = rate
-        requests.post(flush_cache_url)
+        # requests.post(flush_cache_url)
         time.sleep(1)
         performance_data = WorkloadGenerator(args).run()
         log_to_jsonl_file(performance_data, args.log_file, tag=args.tag)

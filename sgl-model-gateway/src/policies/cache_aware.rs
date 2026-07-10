@@ -113,6 +113,7 @@ pub struct CacheAwarePolicy {
     trees: Arc<DashMap<String, Arc<Tree>>>,
     mesh_sync: OptionalMeshSyncManager,
     _eviction_task: Option<PeriodicTask>,
+    low_match_counter: std::sync::atomic::AtomicUsize,
 }
 
 impl CacheAwarePolicy {
@@ -153,6 +154,7 @@ impl CacheAwarePolicy {
             trees,
             mesh_sync: None,
             _eviction_task: eviction_task,
+            low_match_counter: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -401,6 +403,15 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         let is_imbalanced = max_load.saturating_sub(min_load) > self.config.balance_abs_threshold
             && (max_load as f32) > (min_load as f32 * self.config.balance_rel_threshold);
 
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let worker_loads: Vec<(&str, usize)> =
+                workers.iter().map(|w| (w.url(), w.load())).collect();
+            debug!(
+                "Load check | is_imbalanced: {} | max: {} | min: {} | workers: {:?}",
+                is_imbalanced, max_load, min_load, worker_loads
+            );
+        }
+
         if is_imbalanced {
             return self.select_worker_min_load(
                 workers,
@@ -438,14 +449,23 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                     .position(|w| w.url() == tenant_url)
                     .filter(|&idx| workers[idx].is_healthy())
             } else {
-                // Low cache match: use worker with minimum load
-                healthy_indices
-                    .iter()
-                    .min_by_key(|&&idx| workers[idx].load())
-                    .copied()
+                // Low cache match: use round-robin to avoid always picking index 0
+                // when all workers have the same load (common in low-concurrency scenarios)
+                let counter = self.low_match_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let idx_in_healthy = counter % healthy_indices.len();
+                Some(healthy_indices[idx_in_healthy])
             };
 
             if let Some(idx) = selected_idx {
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    let worker_loads: Vec<(&str, usize)> =
+                        workers.iter().map(|w| (w.url(), w.load())).collect();
+                    debug!(
+                        "Cache-aware routing (balanced) | match_rate: {:.3} | threshold: {} | selected: {} | workers: {:?}",
+                        match_rate, self.config.cache_threshold, workers[idx].url(), worker_loads
+                    );
+                }
+
                 // Update the tree with this request (use worker URL directly, no allocation)
                 tree.insert(text, workers[idx].url());
 

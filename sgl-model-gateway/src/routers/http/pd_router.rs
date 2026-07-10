@@ -1,4 +1,4 @@
-use std::{borrow::Cow, sync::Arc, time::Instant};
+use std::{sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use axum::{
@@ -56,11 +56,6 @@ pub struct PDRouter {
     pub enable_igw: bool,
 }
 
-struct PreparedWorkerRequest<'a> {
-    endpoint_url: String,
-    body: Cow<'a, Value>,
-}
-
 #[derive(Clone)]
 struct PDRequestContext<'a> {
     route: &'static str,
@@ -82,20 +77,16 @@ struct PDRequestContext<'a> {
 struct BreakerOutcomesRecorded;
 
 impl PDRouter {
-    fn worker_endpoint_url(worker: &dyn Worker, endpoint: &str) -> String {
-        api_path(worker.base_url(), endpoint)
-    }
-
     async fn proxy_to_first_prefill_worker(
         &self,
         endpoint: &str,
         headers: Option<Vec<(String, String)>>,
     ) -> Response {
         let workers = self.worker_registry.get_prefill_workers();
+        let first_worker_url = workers.first().map(|w| w.url().to_string());
 
-        if let Some(worker) = workers.first() {
-            self.proxy_to_worker(worker.as_ref(), endpoint, headers)
-                .await
+        if let Some(worker_url) = first_worker_url {
+            self.proxy_to_worker(worker_url, endpoint, headers).await
         } else {
             error::service_unavailable("no_prefill_servers", "No prefill servers available")
         }
@@ -103,11 +94,11 @@ impl PDRouter {
 
     async fn proxy_to_worker(
         &self,
-        worker: &dyn Worker,
+        worker_url: String,
         endpoint: &str,
         headers: Option<Vec<(String, String)>>,
     ) -> Response {
-        let url = Self::worker_endpoint_url(worker, endpoint);
+        let url = format!("{}/{}", worker_url, endpoint);
         let mut request_builder = self.client.get(&url);
 
         if let Some(headers) = headers {
@@ -233,7 +224,6 @@ impl PDRouter {
     const BOOTSTRAP_HOST_KEY: &'static str = "bootstrap_host";
     const BOOTSTRAP_PORT_KEY: &'static str = "bootstrap_port";
     const BOOTSTRAP_ROOM_KEY: &'static str = "bootstrap_room";
-    const DISAGG_PREFILL_DP_RANK_KEY: &'static str = "disagg_prefill_dp_rank";
 
     fn inject_bootstrap_into_value(
         mut original: Value,
@@ -293,73 +283,6 @@ impl PDRouter {
             );
         }
         Ok(original)
-    }
-
-    fn inject_prefill_dp_rank_for_decode<'a>(
-        decode_request: Cow<'a, Value>,
-        prefill_worker: &dyn Worker,
-    ) -> Result<Cow<'a, Value>, String> {
-        let Some(prefill_dp_rank) = prefill_worker.dp_rank() else {
-            return Ok(decode_request);
-        };
-
-        let mut decode_request = decode_request.into_owned();
-        let Some(obj) = decode_request.as_object_mut() else {
-            return Err(
-                "Failed to insert disagg_prefill_dp_rank because request body is not an object"
-                    .to_string(),
-            );
-        };
-
-        obj.insert(
-            Self::DISAGG_PREFILL_DP_RANK_KEY.to_string(),
-            Value::from(prefill_dp_rank as u64),
-        );
-        Ok(Cow::Owned(decode_request))
-    }
-
-    async fn prepare_worker_request<'a>(
-        route: &'static str,
-        worker: &dyn Worker,
-        json_request: Cow<'a, Value>,
-    ) -> Result<PreparedWorkerRequest<'a>, String> {
-        let body = if worker.is_dp_aware() {
-            Cow::Owned(
-                worker
-                    .prepare_request(json_request.into_owned())
-                    .await
-                    .map_err(|err| {
-                        format!(
-                            "Failed to prepare request for worker {}: {}",
-                            worker.url(),
-                            err
-                        )
-                    })?,
-            )
-        } else {
-            json_request
-        };
-
-        Ok(PreparedWorkerRequest {
-            endpoint_url: Self::worker_endpoint_url(worker, route),
-            body,
-        })
-    }
-
-    async fn prepare_pd_worker_requests<'a>(
-        route: &'static str,
-        json_request: &'a Value,
-        prefill: &dyn Worker,
-        decode: &dyn Worker,
-    ) -> Result<(PreparedWorkerRequest<'a>, PreparedWorkerRequest<'a>), String> {
-        let prefill_request =
-            Self::prepare_worker_request(route, prefill, Cow::Borrowed(json_request)).await?;
-        let decode_json_request =
-            Self::inject_prefill_dp_rank_for_decode(Cow::Borrowed(json_request), prefill)?;
-        let decode_request =
-            Self::prepare_worker_request(route, decode, decode_json_request).await?;
-
-        Ok((prefill_request, decode_request))
     }
 
     async fn execute_dual_dispatch<T: Serialize + Clone>(
@@ -523,7 +446,6 @@ impl PDRouter {
         &self,
         res: reqwest::Response,
         context: &PDRequestContext<'_>,
-        prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
     ) -> Response {
         let status = res.status();
@@ -567,7 +489,6 @@ impl PDRouter {
                 None,
                 context.return_logprob,
                 Some(response_headers),
-                prefill,
                 decode,
             )
         } else {
@@ -646,7 +567,7 @@ impl PDRouter {
     async fn execute_dual_dispatch_internal(
         &self,
         headers: Option<&HeaderMap>,
-        json_request: Value,
+        mut json_request: Value,
         context: PDRequestContext<'_>,
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
@@ -654,42 +575,69 @@ impl PDRouter {
     ) -> Response {
         // For non-streaming: use guard for automatic load management
         // For streaming: load will be managed in create_streaming_response
-        let _prefill_guard =
-            (!context.is_stream).then(|| WorkerLoadGuard::new(prefill.clone(), headers));
         let _decode_guard =
             (!context.is_stream).then(|| WorkerLoadGuard::new(decode.clone(), headers));
+        // Prefill guard is created before tokio::join! and dropped after
+        // process_prefill_response completes (see below), so load_counter
+        // accurately reflects the prefill processing window.
+        let prefill_guard = WorkerLoadGuard::new(prefill.clone(), headers);
 
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
         inject_trace_context_http(&mut headers_with_trace);
         let headers = Some(&headers_with_trace);
 
-        let (prepared_prefill, prepared_decode) = match Self::prepare_pd_worker_requests(
-            context.route,
-            &json_request,
-            prefill.as_ref(),
-            decode.as_ref(),
-        )
-        .await
-        {
-            Ok(requests) => requests,
-            Err(e) => {
-                error!("Failed to prepare PD worker requests: {}", e);
-                return error::internal_error("pd_request_preparation_failed", e);
+        // Inject request ID into body as "rid" for PD instances
+        if let Some(request_id_value) = headers_with_trace.get("x-request-id") {
+            if let Ok(rid_str) = request_id_value.to_str() {
+                if let Some(obj) = json_request.as_object_mut() {
+                    obj.insert("rid".to_string(), Value::String(rid_str.to_string()));
+                }
             }
+        }
+
+        // Build per-worker request bodies with correct data_parallel_rank
+        let prefill_json = if let Some(dp_rank) = prefill.dp_rank() {
+            let mut req = json_request.clone();
+            if let Some(obj) = req.as_object_mut() {
+                obj.insert("data_parallel_rank".to_string(), serde_json::json!(dp_rank));
+            }
+            req
+        } else {
+            json_request.clone()
+        };
+        let decode_json = {
+            let mut req = json_request;
+            if let Some(obj) = req.as_object_mut() {
+                // decode's own dp_rank
+                if let Some(dp_rank) = decode.dp_rank() {
+                    obj.insert("data_parallel_rank".to_string(), serde_json::json!(dp_rank));
+                }
+                // Paired prefill's dp_rank — tells decode which prefill DP rank to
+                // pull KV from, avoiding the slow prefill-dp-rank resolution path.
+                if let Some(p_rank) = prefill.dp_rank() {
+                    obj.insert(
+                        "disagg_prefill_dp_rank".to_string(),
+                        serde_json::json!(p_rank),
+                    );
+                }
+            }
+            req
         };
 
         // Build both requests
         let prefill_request = self.build_post_with_headers(
             &self.client,
-            &prepared_prefill.endpoint_url,
-            &prepared_prefill.body,
+            prefill.base_url(),
+            context.route,
+            &prefill_json,
             headers,
             false,
         );
         let decode_request = self.build_post_with_headers(
             &self.client,
-            &prepared_decode.endpoint_url,
-            &prepared_decode.body,
+            decode.base_url(),
+            context.route,
+            &decode_json,
             headers,
             false,
         );
@@ -817,7 +765,7 @@ impl PDRouter {
                     }
 
                     let mut response = self
-                        .handle_decode_error_response(res, &context, prefill, decode)
+                        .handle_decode_error_response(res, &context, decode)
                         .await;
                     response.extensions_mut().insert(BreakerOutcomesRecorded);
                     return response;
@@ -847,6 +795,9 @@ impl PDRouter {
                     }
                 };
 
+                // Prefill processing (KV transfer) is done — release load counter
+                drop(prefill_guard);
+
                 if context.is_stream {
                     // Streaming response
                     let prefill_logprobs = if context.return_logprob {
@@ -868,7 +819,6 @@ impl PDRouter {
                         prefill_logprobs,
                         context.return_logprob,
                         Some(response_headers),
-                        prefill,
                         decode,
                     )
                 } else {
@@ -1108,7 +1058,6 @@ impl PDRouter {
         prefill_logprobs: Option<Value>,
         return_logprob: bool,
         headers: Option<HeaderMap>,
-        prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
     ) -> Response {
         use crate::core::AttachedBody;
@@ -1199,7 +1148,6 @@ impl PDRouter {
         let body = Body::from_stream(stream);
 
         let guards = vec![
-            WorkerLoadGuard::new(prefill, headers.as_ref()),
             WorkerLoadGuard::new(decode, headers.as_ref()),
         ];
 
@@ -1358,12 +1306,13 @@ impl PDRouter {
     fn build_post_with_headers(
         &self,
         client: &Client,
-        endpoint_url: &str,
+        url: &str,
+        route: &'static str,
         json_request: &Value,
         headers: Option<&HeaderMap>,
         connection_close: bool,
     ) -> reqwest::RequestBuilder {
-        let mut request = client.post(endpoint_url).json(json_request);
+        let mut request = client.post(api_path(url, route)).json(json_request);
         if connection_close {
             request = request.header("Connection", "close");
         }
@@ -1471,8 +1420,8 @@ impl RouterTrait for PDRouter {
             }
         };
 
-        let prefill_url = Self::worker_endpoint_url(prefill.as_ref(), "health_generate");
-        let decode_url = Self::worker_endpoint_url(decode.as_ref(), "health_generate");
+        let prefill_url = format!("{}/health_generate", prefill.base_url());
+        let decode_url = format!("{}/health_generate", decode.base_url());
         let (prefill_result, decode_result) = tokio::join!(
             self.client.get(&prefill_url).send(),
             self.client.get(&decode_url).send()
@@ -1716,7 +1665,7 @@ impl RouterTrait for PDRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{BasicWorkerBuilder, DPAwareWorkerBuilder, WorkerType};
+    use crate::core::{BasicWorkerBuilder, WorkerType};
 
     fn create_test_pd_router() -> PDRouter {
         let worker_registry = Arc::new(WorkerRegistry::new());
@@ -1996,20 +1945,19 @@ mod tests {
                 None,
                 false,
                 None,
-                prefill_ref.clone(),
                 decode_ref.clone(),
             );
 
-            // Guards are now attached to response body, so load should be 1
-            assert_eq!(prefill_ref.load(), 1);
+            // Only decode guard is attached to response body
+            assert_eq!(prefill_ref.load(), 0);
             assert_eq!(decode_ref.load(), 1);
 
             tx.send(bytes::Bytes::from("test data")).unwrap();
 
             sleep(Duration::from_millis(10)).await;
 
-            // Load still 1 while response body exists
-            assert_eq!(prefill_ref.load(), 1);
+            // Decode load still 1 while response body exists
+            assert_eq!(prefill_ref.load(), 0);
             assert_eq!(decode_ref.load(), 1);
 
             drop(tx);
@@ -2018,7 +1966,7 @@ mod tests {
             drop(response);
         }
 
-        // Guards dropped when response dropped
+        // Decode guard dropped when response dropped
         assert_eq!(prefill_ref.load(), 0);
         assert_eq!(decode_ref.load(), 0);
     }

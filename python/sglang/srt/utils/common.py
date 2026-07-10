@@ -2381,8 +2381,23 @@ def _get_fastapi_request_path(request) -> Tuple[str, bool]:
 
     for route in request.app.routes:
         match, child_scope = route.matches(request.scope)
-        if match == Match.FULL:
-            return route.path, True
+        if match != Match.FULL:
+            continue
+        # Most routes expose `.path` directly. Use getattr so a route type
+        # without it (e.g. FastAPI >=0.137's `_IncludedRouter`, added by
+        # app.include_router(), which matches requests but has no `.path`)
+        # does not raise AttributeError.
+        path = getattr(route, "path", None)
+        if path is not None:
+            return path, True
+        # Drill into the included router's effective sub-routes, which carry
+        # the prefixed `.path`, to recover the real path (e.g. /v1/loads).
+        effective_route_contexts = getattr(route, "effective_route_contexts", None)
+        if callable(effective_route_contexts):
+            for ctx in effective_route_contexts():
+                ctx_match, _ = ctx.matches(request.scope)
+                if ctx_match == Match.FULL and getattr(ctx, "path", None):
+                    return ctx.path, True
 
     return request.url.path, False
 

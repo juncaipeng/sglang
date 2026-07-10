@@ -247,6 +247,11 @@ where
         // Insert request ID into request extensions for other middleware/handlers to use
         req.extensions_mut().insert(RequestId(request_id.clone()));
 
+        // Also insert into request headers so downstream handlers (e.g., pd_router) can read it
+        if let Ok(header_value) = HeaderValue::from_str(&request_id) {
+            req.headers_mut().insert("x-request-id", header_value);
+        }
+
         // Call the inner service
         let future = self.inner.call(req);
 
